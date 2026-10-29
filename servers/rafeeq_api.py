@@ -3,30 +3,23 @@
 # dependencies = ["fastapi>=0.150", "uvicorn>=0.40", "openai>=3.30", "pydantic>=2.12", "python-dotenv>=1.1",
 #                 "opentelemetry-sdk>=1.45"]
 # ///
-"""Rafeeq as an HTTP service: the reference solution of Lab 4.4.
+"""Rafeeq HTTP service with local demo web UI.
 
-    RAFEEQ_API_KEYS=dev-key-1 uv run servers/rafeeq_api.py --port 8793
+Run from repository root:
+    AGENT_MODEL=nvidia/nemotron-3.5-lightning:free RAFEEQ_API_KEYS=dev-key-1 \
+      uv run servers/rafeeq_api.py --port 8793
 
-    curl -s localhost:8793/v1/chat -H "X-API-Key: dev-key-1" -H "Content-Type: application/json" \
-         -d '{"session_id": "s1", "message": "What are your office hours?"}'
-
-What it adds around the Day 1 loop:
-- an API key per client (header X-API-Key; keys from RAFEEQ_API_KEYS, comma-separated);
-- sessions: the conversation is stored in SQLite and continued on the next request with the same session_id;
-- budgets: at most RAFEEQ_SESSION_TOKENS tokens per session (HTTP 429 after that) and RAFEEQ_MAX_STEPS steps per turn;
-- fallbacks: OpenRouter's `models` list (agentkit.FALLBACKS), then one retry on a second model if the call fails;
-- least privilege: read tools run; write tools are never executed by the service, they are queued for an officer
-  (table pending_actions) and the reply says so;
-- traces: OpenTelemetry spans with GenAI attributes (invoke_agent → chat / execute_tool), written as JSON lines to
-  artifacts/traces/rafeeq_api.jsonl (swap in an OTLP exporter to send them to Jaeger, Phoenix, Langfuse, ...).
+The REST endpoint /v1/chat requires X-API-Key. The browser UI at / uses
+short-lived in-process session tokens and is restricted to localhost.
+Do not expose this demo UI to a public network.
 """
-
 from __future__ import annotations
 
 import argparse
 import functools
 import json
 import os
+import secrets
 import sqlite3
 import sys
 import threading
@@ -36,7 +29,8 @@ from pathlib import Path
 LABS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(LABS))
 
-from fastapi import Depends, FastAPI, Header, HTTPException  # noqa: E402
+from fastapi import Depends, FastAPI, Header, HTTPException, Request  # noqa: E402
+from fastapi.responses import FileResponse  # noqa: E402
 from opentelemetry import trace  # noqa: E402
 from opentelemetry.sdk.trace import TracerProvider  # noqa: E402
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult  # noqa: E402
@@ -51,7 +45,6 @@ MAX_STEPS = int(os.getenv("RAFEEQ_MAX_STEPS", "6"))
 SECOND_MODEL = os.getenv("RAFEEQ_SECOND_MODEL", K.FALLBACKS[0] if K.FALLBACKS else K.MODEL)
 
 
-# ---------------------------------------------------------------- traces
 class JsonlExporter(SpanExporter):
     def __init__(self, path: Path):
         self.path = path
@@ -60,11 +53,14 @@ class JsonlExporter(SpanExporter):
     def export(self, spans) -> SpanExportResult:
         with self.path.open("a", encoding="utf-8") as f:
             for s in spans:
-                f.write(json.dumps({"name": s.name, "trace_id": f"{s.context.trace_id:032x}",
-                                    "span_id": f"{s.context.span_id:016x}",
-                                    "parent_id": f"{s.parent.span_id:016x}" if s.parent else None,
-                                    "ms": round((s.end_time - s.start_time) / 1e6, 1),
-                                    "attributes": dict(s.attributes or {})}, ensure_ascii=False) + "\n")
+                f.write(json.dumps({
+                    "name": s.name,
+                    "trace_id": f"{s.context.trace_id:032x}",
+                    "span_id": f"{s.context.span_id:016x}",
+                    "parent_id": f"{s.parent.span_id:016x}" if s.parent else None,
+                    "ms": round((s.end_time - s.start_time) / 1e6, 1),
+                    "attributes": dict(s.attributes or {}),
+                }, ensure_ascii=False) + "\n")
         return SpanExportResult.SUCCESS
 
 
@@ -75,7 +71,7 @@ def tracer_for(path: Path):
 
 
 class TracedShape(K.ChatShape):
-    """Chat Completions with one `chat {model}` span per model call."""
+    """Chat Completions with one trace span per model call."""
 
     def __init__(self, tracer, **kw):
         super().__init__(**kw)
@@ -103,7 +99,6 @@ def traced(tracer, fn):
     return wrapper
 
 
-# ---------------------------------------------------------------- the service
 class ChatIn(BaseModel):
     session_id: str = Field(min_length=1, max_length=64, pattern=r"^[\w.-]+$")
     message: str = Field(min_length=1, max_length=4000)
@@ -127,8 +122,41 @@ def create_app(workdir: Path | None = None, trace_file: Path | None = None) -> F
         con.execute("CREATE TABLE IF NOT EXISTS pending_actions (session_id TEXT, tool TEXT, args TEXT, created REAL)")
     tracer = tracer_for(trace_file or K.ARTIFACTS / "traces" / "rafeeq_api.jsonl")
     tools = [traced(tracer, t) for t in m.tools()]
-    lock = threading.Lock()  # one agent run at a time: K.LEDGER is process-wide (fine for a lab, not for scale)
+    lock = threading.Lock()
     app = FastAPI(title="Rafeeq API", version="1.0.0")
+
+    # Tokens live only in server memory. Browser access is restricted to local
+    # requests; this is deliberately a demo mechanism, not production auth.
+    web_sessions: dict[str, float] = {}
+    WEB_SESSION_SECONDS = 60 * 60 * 4
+
+    def require_local(request: Request):
+        if request.client is None or request.client.host not in {"127.0.0.1", "::1"}:
+            raise HTTPException(403, "Local access only")
+        # Browsers send an Origin on cross-origin POSTs. Reject them to prevent
+        # another website from using the locally running agent.
+        origin = request.headers.get("origin")
+        if origin and origin != str(request.base_url).rstrip("/"):
+            raise HTTPException(403, "Cross-origin request denied")
+
+    @app.get("/")
+    def home(request: Request):
+        require_local(request)
+        page = LABS / "index.html"
+        if not page.is_file():
+            raise HTTPException(404, "index.html not found in project root")
+        return FileResponse(page, headers={"Cache-Control": "no-store"})
+
+    @app.get("/web/session")
+    def create_web_session(request: Request):
+        require_local(request)
+        now = time.time()
+        for token, expiry in list(web_sessions.items()):
+            if expiry <= now:
+                web_sessions.pop(token, None)
+        token = secrets.token_urlsafe(32)
+        web_sessions[token] = now + WEB_SESSION_SECONDS
+        return {"token": token}
 
     def api_key(x_api_key: str = Header(default="")) -> str:
         if x_api_key not in API_KEYS:
@@ -159,14 +187,15 @@ def create_app(workdir: Path | None = None, trace_file: Path | None = None) -> F
             span.set_attribute("gen_ai.agent.name", "Rafeeq")
             span.set_attribute("gen_ai.conversation.id", req.session_id)
             before = (K.LEDGER.input_tokens, K.LEDGER.output_tokens)
-            kw = dict(system=madar.SYSTEM_PROMPT, shape=TracedShape(tracer), history=history, max_steps=MAX_STEPS,
-                      permission=permission, verbose=False)
+            kw = dict(system=madar.SYSTEM_PROMPT, shape=TracedShape(tracer), history=history,
+                      max_steps=MAX_STEPS, permission=permission, verbose=False)
             try:
                 run = K.run_agent(req.message, tools, **kw)
-            except Exception as e:  # noqa: BLE001 - every model in the routing list failed: try a second model once
+            except Exception as e:
                 span.set_attribute("error.type", type(e).__name__)
                 run = K.run_agent(req.message, tools, model=SECOND_MODEL, **kw)
-            used = {"input": K.LEDGER.input_tokens - before[0], "output": K.LEDGER.output_tokens - before[1]}
+            used = {"input": K.LEDGER.input_tokens - before[0],
+                    "output": K.LEDGER.output_tokens - before[1]}
         reply = run.final or "I couldn't finish this request. An officer will follow up."
         if pending:
             reply += "\n\n(An officer will review and confirm: " + ", ".join(p["tool"] for p in pending) + ".)"
@@ -175,9 +204,23 @@ def create_app(workdir: Path | None = None, trace_file: Path | None = None) -> F
                         (f"{key}:{req.session_id}", json.dumps(run.state[1:], ensure_ascii=False, default=str),
                          spent + used["input"] + used["output"], time.time()))
             con.executemany("INSERT INTO pending_actions VALUES (?,?,?,?)",
-                            [(req.session_id, p["tool"], json.dumps(p["args"], ensure_ascii=False), time.time()) for p in pending])
+                            [(req.session_id, p["tool"], json.dumps(p["args"], ensure_ascii=False), time.time())
+                             for p in pending])
         return ChatOut(session_id=req.session_id, reply=reply, tools=[n for n, _ in run.tool_calls],
                        pending_actions=pending, tokens=used, model_steps=run.steps)
+
+    @app.post("/web/chat", response_model=ChatOut)
+    def web_chat(req: ChatIn, request: Request,
+                 token: str = Header(default="", alias="X-Web-Session")) -> ChatOut:
+        require_local(request)
+        expiry = web_sessions.get(token, 0)
+        if not token or expiry <= time.time():
+            raise HTTPException(401, "Invalid or expired web session")
+        # Keep browser conversations separate from external API clients.
+        # The real API key is used only inside the Python process.
+        if not API_KEYS:
+            raise HTTPException(503, "API key not configured")
+        return chat(req, key=sorted(API_KEYS)[0])
 
     return app
 
